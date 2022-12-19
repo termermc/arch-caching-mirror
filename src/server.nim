@@ -122,9 +122,7 @@ proc handleReq(req: Request) {.async, gcsafe.} =
                             let stream = mirrorRes.bodyStream
                             block readMirror:
                                 while true:
-                                    echo "READ..."
                                     let (ended, buf) = await stream.read()
-                                    echo "READ."
                                     if not ended:
                                         break readMirror
 
