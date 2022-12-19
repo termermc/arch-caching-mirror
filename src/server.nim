@@ -122,8 +122,8 @@ proc handleReq(req: Request) {.async, gcsafe.} =
                             let stream = mirrorRes.bodyStream
                             block readMirror:
                                 while true:
-                                    let (ended, buf) = await stream.read()
-                                    if not ended:
+                                    let (hasValue, buf) = await stream.read()
+                                    if not hasValue:
                                         break readMirror
 
                                     if shouldCache:
