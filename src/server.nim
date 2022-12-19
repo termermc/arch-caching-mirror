@@ -1,4 +1,4 @@
-import std/[asyncdispatch, asynchttpserver, httpclient, asyncfile, asyncstreams, asyncnet, os, tables, strformat, nre, options]
+import std/[asyncdispatch, asynchttpserver, httpclient, asyncfile, asyncstreams, asyncnet, os, tables, strformat, nre, options, strutils]
 import "."/[constants, utils]
 
 # Server global state
@@ -31,6 +31,8 @@ proc handleReq(req: Request) {.async, gcsafe.} =
         let pathArch = pathCaptures[1]
         let pathFile = pathCaptures[2]
 
+        let isDbFile = pathFile.endsWith(".db")
+
         # Await an existing download Future for the requested file if present
         if pkgDlFutures.hasKey(pathFile):
             await pkgDlFutures[pathFile]
@@ -38,7 +40,7 @@ proc handleReq(req: Request) {.async, gcsafe.} =
         # Check for file in local cache, and if so, send it
         let pkgFilePath = pkgCachePath / pathFile
         let fileInfoOption = getFileInfoOrNone(pkgFilePath)
-        if fileInfoOption.isSome:
+        if not isDbFile and fileInfoOption.isSome:
             let fileInfo = fileInfoOption.get
             if fileInfo.kind in {pcFile, pcLinkToFile}:
                 # Send HTTP response
@@ -89,12 +91,15 @@ proc handleReq(req: Request) {.async, gcsafe.} =
 
                     # Create download Future
                     var future = Future[void]()
-                    pkgDlFutures[pathFile] = future
+                    if not isDbFile:
+                        pkgDlFutures[pathFile] = future
 
                     try:
-                        # Open package file for writing
-                        var file = openAsync(pkgFilePath, fmWrite)
-                        echo fmt"Package file {pathFile} was requested, but not in cache; downloading from mirror {mirror}..."
+                        # Open file for writing if it's not a DB file
+                        var file: AsyncFile
+                        if not isDbFile:
+                            file = openAsync(pkgFilePath, fmWrite)
+                            echo fmt"Package file {pathFile} was requested, but not in cache; downloading from mirror {mirror}..."
                         
                         try:
                             let stream = mirrorRes.bodyStream
@@ -104,13 +109,18 @@ proc handleReq(req: Request) {.async, gcsafe.} =
                                     if not ended:
                                         break readMirror
 
-                                    await file.write(buf)
+                                    if not isDbFile:
+                                        await file.write(buf)
+
                                     await req.client.send(buf)
 
-                            echo fmt"Successfully downloaded {pathFile} from mirror {mirror}"
+                            if not isDbFile:
+                                echo fmt"Successfully downloaded {pathFile} from mirror {mirror}"
+
                             success = true
                         finally:
-                            file.close()
+                            if not isDbFile:
+                                file.close()
                             if not req.client.isClosed:
                                 req.client.close()
 
@@ -119,7 +129,9 @@ proc handleReq(req: Request) {.async, gcsafe.} =
                     finally:
                         if not future.finished:
                             future.complete()
-                        pkgDlFutures.del(pathFile)
+                        
+                        if not isDbFile:
+                            pkgDlFutures.del(pathFile)
             except:
                 stderr.writeLine(fmt"Request to mirror {mirror} failed:")
                 stderr.writeLine(fmt"{getCurrentExceptionMsg()}: {repr(getCurrentException())}")
