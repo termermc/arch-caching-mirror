@@ -5,7 +5,6 @@ import "."/[constants, utils]
 var repoPathPattern {.threadvar.}: Regex
 var pkgCachePath {.threadvar.}: string
 var pkgMirrors {.threadvar.}: seq[string]
-var mirrorClient {.threadvar.}: AsyncHttpClient
 var pkgDlFutures {.threadvar.}: Table[string, Future[void]]
 
 proc handleReq(req: Request) {.async, gcsafe.} =
@@ -36,6 +35,18 @@ proc handleReq(req: Request) {.async, gcsafe.} =
         # Await an existing download Future for the requested file if present
         if pkgDlFutures.hasKey(pathFile):
             await pkgDlFutures[pathFile]
+        
+        # Parse byte range if present
+        var readStart: int64 = 0
+        var readEnd: int64 = -1
+        var httpResCode = Http200
+        if req.headers.hasKey("range"):
+            let rangeParts = req.headers["range"].substr(6).split('-')
+            readStart = rangeParts[0].parseBiggestInt()
+            if rangeParts[1] != "":
+                readEnd = rangeParts[1].parseBiggestInt()
+        
+            httpResCode = Http206
 
         # Check for file in local cache, and if so, send it
         let pkgFilePath = pkgCachePath / pathFile
@@ -43,8 +54,10 @@ proc handleReq(req: Request) {.async, gcsafe.} =
         if not isDbFile and fileInfoOption.isSome:
             let fileInfo = fileInfoOption.get
             if fileInfo.kind in {pcFile, pcLinkToFile}:
+                var headers = genPackageHeaders(readStart, readEnd, fileInfo.size, httpResCode == Http206, fileInfo.lastWriteTime)
+                
                 # Send HTTP response
-                await req.respond(Http200, "", genPackageHeaders(fileInfo.size, fileInfo.lastWriteTime))
+                await req.respond(httpResCode, "", newHttpHeaders(headers))
 
                 # End request if the method was HEAD
                 if req.reqMethod == HttpHead:
@@ -54,6 +67,11 @@ proc handleReq(req: Request) {.async, gcsafe.} =
                 var file = openAsync(pkgFilePath, fmRead)
                 var buf: array[READ_BUF_SIZE, uint8]
 
+                if readStart > 0:
+                    file.setFilePos(readStart)
+                if readEnd > -1:
+                    file.setFileSize(readEnd + 1)
+
                 try:
                     # Send file
                     while not req.client.isClosed():
@@ -62,42 +80,41 @@ proc handleReq(req: Request) {.async, gcsafe.} =
                             break
 
                         await req.client.send(addr buf, bufLen)
-                
+
                 finally:
                     # Clean up resources
                     file.close()
-                    if not req.client.isClosed():
-                        req.client.close()
 
                     return
         
         # The package wasn't found in the local cache; try to fetch it from a remote mirror
         for mirror in pkgMirrors:
+            let shouldCache = not isDbFile and not req.headers.hasKey("range")
+
             # Check if the mirror has the package
-            let mirrorRes = await mirrorClient.requestPackage(mirror, pathRepo, pathArch, pathFile, req.reqMethod)
+            var mirrorClient = newAsyncHttpClient()
+            let mirrorRes = await mirrorClient.requestPackage(mirror, pathRepo, pathArch, pathFile, req.reqMethod, req.headers.getOrDefault("range"))
 
             var success = false
 
             try:
-                if mirrorRes.status == "200 OK":
+                if mirrorRes.code == Http200:
                     # Send HTTP response
-                    let lastModified = mirrorRes.headers.getOrDefault("last-modified", HttpHeaderValues(@[nowUtcStr()]))
-                    await req.respond(Http200, "", genPackageHeaders(mirrorRes.contentLength, lastModified))
+                    await req.respond(mirrorRes.code, "", mirrorRes.headers)
 
                     # If this is a HEAD request, end right now
                     if req.reqMethod == HttpHead:
-                        req.client.close()
                         return
 
                     # Create download Future
                     var future = Future[void]()
-                    if not isDbFile:
+                    if shouldCache:
                         pkgDlFutures[pathFile] = future
 
                     try:
                         # Open file for writing if it's not a DB file
                         var file: AsyncFile
-                        if not isDbFile:
+                        if shouldCache:
                             file = openAsync(pkgFilePath, fmWrite)
                             echo fmt"Package file {pathFile} was requested, but not in cache; downloading from mirror {mirror}..."
                         
@@ -105,24 +122,24 @@ proc handleReq(req: Request) {.async, gcsafe.} =
                             let stream = mirrorRes.bodyStream
                             block readMirror:
                                 while true:
+                                    echo "READ..."
                                     let (ended, buf) = await stream.read()
+                                    echo "READ."
                                     if not ended:
                                         break readMirror
 
-                                    if not isDbFile:
+                                    if shouldCache:
                                         await file.write(buf)
 
                                     await req.client.send(buf)
 
-                            if not isDbFile:
+                            if shouldCache:
                                 echo fmt"Successfully downloaded {pathFile} from mirror {mirror}"
 
                             success = true
                         finally:
-                            if not isDbFile:
+                            if shouldCache:
                                 file.close()
-                            if not req.client.isClosed:
-                                req.client.close()
 
                             if not success:
                                 removeFile(pkgFilePath)
@@ -130,11 +147,13 @@ proc handleReq(req: Request) {.async, gcsafe.} =
                         if not future.finished:
                             future.complete()
                         
-                        if not isDbFile:
+                        if shouldCache:
                             pkgDlFutures.del(pathFile)
             except:
                 stderr.writeLine(fmt"Request to mirror {mirror} failed:")
                 stderr.writeLine(fmt"{getCurrentExceptionMsg()}: {repr(getCurrentException())}")
+            finally:
+                mirrorClient.close()
             
             if success:
                 return
@@ -158,7 +177,6 @@ proc startServer*(host: string, port: Port, cachePath: string, mirrorlistPath: s
     repoPathPattern = re"^\/(\w+)\/os\/(\w+)\/((?!\.\.)[\w\.-]+)$"
     pkgCachePath = cachePath
     pkgMirrors = await parseMirrorlistFile(mirrorlistPath)
-    mirrorClient = newAsyncHttpClient()
     pkgDlFutures = Table[string, Future[void]]()
 
     var server = newAsyncHttpServer()

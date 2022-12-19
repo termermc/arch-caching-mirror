@@ -1,4 +1,4 @@
-import std/[os, options, times, asyncdispatch, asynchttpserver, httpclient, nre, strutils, asyncfile]
+import std/[os, options, times, asyncdispatch, asynchttpserver, httpclient, nre, strutils, asyncfile, strformat]
 import "."/[constants]
 
 let mirrorlistServerLinePattern = re"^\W*Server\W*=\W*(https?:\/\/(?:[\w]+\.)*\w+\.\w+\/(?:[\w_]+\/)*\$repo\/(?:[\w_]+\/)*\$arch)\W*$"
@@ -8,7 +8,7 @@ proc getFileInfoOrNone*(path: string): Option[FileInfo] =
     
     try:
         return some(getFileInfo(path))
-    except OSError as e:
+    except OSError:
         return none[FileInfo]()
 
 proc toUtcStr*(time: Time): string =
@@ -21,15 +21,24 @@ proc nowUtcStr*(): string =
     
     return getTime().toUtcStr()
 
-proc genPackageHeaders*(size: SomeNumber, lastModified: Time | string): HttpHeaders {.inline.} =
+proc genPackageHeaders*(readStart: SomeNumber, readEnd: SomeNumber = -1, fileSize: SomeNumber, asRange: bool, lastModified: Time | string): seq[(string, string)] {.inline.} =
     ## Generates package file response headers
 
-    return newHttpHeaders({
+    let readEndReal = if readEnd < 0: fileSize - 1 else: readEnd
+
+    var headers = @{
         "content-type": PACKAGE_MIME,
-        "content-length": $size,
+        "content-length": $(readEndReal - readStart + 1),
         "date": nowUtcStr(),
-        "last-modified": when lastModified is string: lastModified else: lastModified.toUtcStr()
-    })
+        "last-modified": when lastModified is string: lastModified else: lastModified.toUtcStr(),
+        "accept-ranges": "bytes",
+        "vary": "accept-encoding"
+    }
+
+    if asRange:
+        headers.add(("content-range", fmt"bytes {readStart}-{readEnd}/{fileSize}"))
+
+    return headers
 
 proc readFileAsync*(path: string): Future[string] =
     ## Reads an entiire file's contents and returns it as a string
@@ -57,13 +66,15 @@ proc parseMirrorlistFile*(path: string): Future[seq[string]] {.async.} =
     
     return parseMirrorlistContent(await readFileAsync(path))
 
-proc requestPackage*(client: AsyncHttpClient, mirror: string, repo: string, arch: string, file: string, httpMethod: HttpMethod): Future[AsyncResponse] =
+proc requestPackage*(client: AsyncHttpClient, mirror: string, repo: string, arch: string, file: string, httpMethod: HttpMethod, rangeHeader: string = ""): Future[AsyncResponse] =
     ## Makes a request for a package from a specific mirror
-    
+
     # Generate URL
     let url = mirror.multiReplace({
         "$repo": repo,
         "$arch": arch
     }) & '/' & file
 
-    return client.request(url, httpMethod)
+    let headers = if rangeHeader != "": newHttpHeaders({"range": rangeHeader}) else: nil
+
+    return client.request(url, httpMethod, headers = headers)
