@@ -172,7 +172,7 @@ proc startServer*(host: string, port: Port, cachePath: string, mirrorlistPath: s
     ## Starts the server
     
     # Initialize server global data
-    repoPathPattern = re"^\/(\w+)\/os\/(\w+)\/((?!\.\.)[\w\.:_-]+)$"
+    repoPathPattern = re"^\/(\w+)\/os\/(\w+)\/((?!\.\.)[\w\.:_+-]+)$"
     pkgCachePath = cachePath
     pkgMirrors = await parseMirrorlistFile(mirrorlistPath)
     pkgDlFutures = Table[string, Future[void]]()
